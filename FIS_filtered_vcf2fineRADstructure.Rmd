@@ -1,0 +1,602 @@
+---
+title: "vcf2fineRADstructure"
+author: "Matthew Bootsma"
+date: "12/3/2019"
+output: html_document
+---
+# Dependencies
+```{r}
+library(reticulate)
+library(adegenet)
+library(tidyverse)
+library(ggplot2)
+library(ggdendro)
+library(plotly)
+library(cowplot)
+library(ggpubr)
+library(egg)
+```
+# Prepare haps.VCF
+
+Format to Locus, Ind1, Ind2 etc. with genotypes appropriately formatted for fineRADstructure
+
+This block runs in python, and while reticulate allows it to work in this environment, a true python IDE will likely deliver a more fluid experience. I recommend Spyder
+```{python}
+# Author: Matthew Bootsma
+# Last edit: 2/01/2019
+# this script will take a haps.vcf and format the calls into the fineRADstructure format, with the first column containing the locus ID for that row
+# Locus ID should be replaced with actual CHROMOSOME allignment information to run fineRADstructure analysis
+# should also function with a SNPs.vcf but not tested
+
+#set working directory
+import os
+os.getcwd()
+os.chdir("I:\\WAE_RAD_Data\\novoseq2\\SNPs\Genomics\\run_fineRADstructure")
+# open file you are going to write new results to
+out_file = open("fineRAD_genomic_haps.txt", "w")
+# open vcf file read all lines into an array, close file
+raw_vcf_file = open("v2_genomic_haps.recode.vcf", "r")
+raw_vcf_array = raw_vcf_file.readlines()
+raw_vcf_file.close()
+# for each line in vcf file
+for i in raw_vcf_array:
+    # this is trying to recognize the header line
+    if i.startswith("#CHROM"):
+        # First, write column header for the locus ID
+        out_file.write("locus")
+        # then individual names as their own column headers
+        header_line = i.rstrip().split("\t")
+        # isolate the names
+        names = header_line[9:(len(header_line)+1)]
+        # write the names iteratively with a "\t" in between
+        for j in names:
+            out_file.write("\t" + j)
+        # add eol after last name
+        out_file.write("\n")
+        # at this point we should have header line
+
+    # use the if not # to go to the data
+    elif "#" not in i:
+        # split_ind_line is going to hold our genotype calls e.g., 0/2
+        split_ind_line = i.rstrip().split("\t")
+        # Store the locus ID in variable locus_ID
+        locus_ID = split_ind_line[0]
+        # Write that in the first column
+        out_file.write(locus_ID)
+                
+        #Store the haplotype alleles in an array, they will be delimited by ","
+        haplotypes = split_ind_line[3]+","+split_ind_line[4]
+        #immediately break this haplotype allele array into it's components for indexing down the line
+        haplotypes = haplotypes.split(",")
+        
+        #iterate through each genotype and convert it into the desired format
+        # data starts in col 10 so -1 for base 0 index
+        # len calculates the true number of entries from a base 1 index so -1 for base 0 index
+        # k is the genotype reference call at that index, e.g. 0/1
+        for k in split_ind_line[9:(len(header_line)+1)]:
+
+            
+            # handle missing data first
+            if k.startswith("."):
+                out_file.write("\t" + "")
+            else:
+            #break the allele calls down, encapsulate both alleles
+                genotype_k = k.split("/")
+                allele_k_index1 = int(genotype_k[0])
+                allele_call_1 = haplotypes[allele_k_index1]
+                allele_k_index2 = int(genotype_k[1])
+                allele_call_2 = haplotypes[allele_k_index2]
+            # if the allele calls are identical only write 1
+            if allele_call_1 == allele_call_2:
+                out_file.write("\t" + allele_call_1)
+            # if the allele calls are NOT identical, write both, delimit with a "/"
+            else:
+                out_file.write("\t" + allele_call_1 + "/" + allele_call_2)
+        # add eol before moving to next row (haplotype)
+        out_file.write("\n")
+        
+
+out_file.close()  # script parse vcf file get alleles per individual
+
+```
+
+At this point, haps should be filtered and formatted to the fineRADstructure format, now the locus names need to be replaced with the scaffold ID, I'm also going to sort by position.
+
+
+# Merge allignment data to haplotypes
+This analysis is using the YEP blast data, already quality filtered
+
+do a vlookup to append the contig and pos, sort by contig and pos, remove pos and locus ID, that's the proper input now :)
+
+NOTE: from fineRADstructure site "Important note: If you have a reference genome, the RAD loci should ideally be ordered according to genomic coordinates."
+
+# Filter out individuals removed from SNPs data
+```{r}
+ind_list = read.csv("./rmInd_v3.txt")
+head(ind_list)
+head(fineRAD_dat)
+fineRAD_dat = read.csv("fineRAD_haps_algnYEPblast_INPUT.txt", sep = "\t")
+ncol(fineRAD_dat)
+fineRAD_dat = fineRAD_dat[,-which(colnames(fineRAD_dat) %in% ind_list$INDV)]
+ncol(fineRAD_dat)
+write.table(fineRAD_dat,file = "fineRAD_haps_algnYEPblast_INPUT.txt", sep = "\t", row.names = F, quote = F)
+```
+
+
+#---Analyze results---
+
+Having run fineRADstructure, plot and interpret results
+# Base data input
+```{r}
+##################################################################
+## A simple R example for plotting fineRADstructure output
+## Author: Milan Malinsky (millanek@gmail.com), adapted from a Finestructure R Example by Daniel Lawson (dan.lawson@bristol.ac.uk) and using his library of R functions
+## Date: 04/04/2016
+## Notes:
+##    These functions are provided for help working with fineSTRUCTURE output files
+## but are not a fully fledged R package for a reason: they are not robust
+## and may be expected to work only in some specific cases - often they may require 
+## at least minor modifications! USE WITH CAUTION!
+## SEE FinestrictureLibrary.R FOR DETAILS OF THE FUNCTIONS
+##
+## Licence: GPL V3
+## 
+##    This program is free software: you can redistribute it and/or modify
+##    it under the terms of the GNU General Public License as published by
+##    the Free Software Foundation, either version 3 of the License, or
+##    (at your option) any later version.
+
+##    This program is distributed in the hope that it will be useful,
+##    but WITHOUT ANY WARRANTY; without even the implied warranty of
+##    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+##    GNU General Public License for more details.
+
+##    You should have received a copy of the GNU General Public License
+##    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+
+### 1) EDIT THE FOLLOWING THREE LINES TO PROVIDE PATHS TO THE fineRADstructure OUTPUT 
+# setwd("/PATH/TO/fineRADstructure/OUTPUT/") ## The directory where the files are located
+chunkfile<-"./fineRAD_out/fineRAD_haps_algnYEPblast_chunks.out" ## RADpainter output file
+mcmcfile<-"./fineRAD_out/fineRAD_haps_algnYEPblast_chunks.mcmc.xml" ## finestructure mcmc file
+treefile<-"./fineRAD_out/fineRAD_haps_algnYEPblast_chunks.mcmcTree.xml" ## finestructure tree file
+### 2) EDIT THIS PATH TO WHERE YOU WANT THE PLOTS:
+plotsFolder <- "./fineRADstructure_plots/"
+### 3) SET VALUES FOR THESE VARIABLES: "analysisName" will be included in output plots
+analysisName <- "1710_genomic_haps_FIS_filtered";  maxIndv <- 10000; maxPop<-10000
+
+
+### 4) EDIT THE PATH TO YOUR COPY of FinestructureLibrary.R
+source("./FinestructureLibrary.R", chdir = TRUE) # read in the R functions, which also calls the needed packages
+```
+
+# base formatting steps 
+Extract and organize matrix
+```{r}
+### 5) EXECUTE THE CODE ABOVE AND THE REST OF THE CODE BELOW
+## make some colours
+some.colors<-MakeColorYRP() # these are yellow-red-purple
+some.colorsEnd<-MakeColorYRP(final=c(0.2,0.2,0.2)) # as above, but with a dark grey final for capped values
+###### READ IN THE CHUNKCOUNT FILE
+dataraw<-as.matrix(read.table(chunkfile,row.names=1,header=T,skip=1)) # read in the pairwise coincidence 
+###### READ IN THE MCMC FILES
+mcmcxml<-xmlTreeParse(mcmcfile) ## read into xml format
+mcmcdata<-as.data.frame.myres(mcmcxml) ## convert this into a data frame
+###### READ IN THE TREE FILES
+treexml<-xmlTreeParse(treefile) ## read the tree as xml format
+ttree<-extractTree(treexml) ## extract the tree into ape's phylo format
+
+## Reduce the amount of significant digits printed in the posteror assignment probabilities (numbers shown in the tree):
+ttree$node.label[ttree$node.label!=""] <-format(as.numeric(ttree$node.label[ttree$node.label!=""]),digits=0)
+# ttree$node.label
+ttree$node.label[ttree$node.label!=""] <-format("")
+ # convert to dendrogram format
+tdend<-myapetodend(ttree,factor=1)
+## Now we work on the MAP state
+mapstate<-extractValue(treexml,"Pop") # map state as a finestructure clustering
+mapstatelist<-popAsList(mapstate) # .. and as a list of individuals in populations
+popnames<-lapply(mapstatelist,NameSummary) # population names IN A REVERSIBLE FORMAT (I.E LOSSLESS)
+## NOTE: if your population labels don't correspond to the format we used (NAME<number>) YOU MAY HAVE TROUBLE HERE. YOU MAY NEED TO RENAME THEM INTO THIS FORM AND DEFINE YOUR POPULATION NAMES IN popnamesplot BELOW
+popnamesplot<-lapply(mapstatelist,NameMoreSummary) # a nicer summary of the populations
+names(popnames)<-popnamesplot # for nicety only
+names(popnamesplot)<-popnamesplot # for nicety only
+popdend<-makemydend(tdend,mapstatelist) # use NameSummary to make popdend
+popdend<-fixMidpointMembers(popdend) # needed for obscure dendrogram reasons
+popdendclear<-makemydend(tdend,mapstatelist,"NameMoreSummary")# use NameMoreSummary to make popdend
+popdendclear<-fixMidpointMembers(popdendclear) # needed for obscure dendrogram reasons
+```
+# write out the list of tree tip ID's and append the color metadata
+```{r}
+tree_order = labels(tdend) 
+# write.csv(tree_order, file = "./tree_order_d.csv",quote = F, row.names = F)
+mta_dat = read.csv("./tree_order_d.csv")
+```
+
+
+#base plot functions
+ they aren't pretty, but they are correctly organized so use them to verify any manipulation below produces the same result
+```{r}
+########################
+## Plot 1: COANCESTRY MATRIX
+fullorder<-labels(tdend) # the order according to the tree
+datamatrix<-dataraw[fullorder,fullorder] # reorder the data matrix according to the DEND
+
+tmpmat<-datamatrix 
+tmpmat[tmpmat>maxIndv]<-maxIndv #  # cap the heatmap
+
+pdf(file=paste(plotsFolder,analysisName,"-SimpleCoancestry.pdf",sep=""),height=25,width=25)
+plotFinestructure(tmpmat,
+                  mta_dat$pop_ID,
+                  text.col = "white",
+                  # text.col = as.character(mta_dat$lab_col),
+                  tickmarks = 0,
+                  dend=tdend,
+                  cols=some.colorsEnd,
+                  scalenum = 5,
+                  cex.scale = 3,
+                  scalemar = c(5,5,5,5),
+                  # cex.axis=0,
+                  # labmargin = 8,
+                  labelsatx = (1:dim(tmpmat)[1]) -0.5,
+                  edgePar=list(p.lwd=0,t.srt=90,t.off=-0.1,t.cex=1.2))
+dev.off()
+```
+
+```{r}
+########################
+## Plot 2: POPULATIONS AND COANCESTRY AVERAGES
+popmeanmatrix<-getPopMeanMatrix(datamatrix,mapstatelist)
+
+tmpmat<-popmeanmatrix
+tmpmat[tmpmat>maxPop]<-maxPop # cap the heatmap
+
+
+pdf(file=paste(plotsFolder,analysisName,"-PopAveragedCoancestry.pdf",sep=""),height=25,width=25)
+plotFinestructure(tmpmat,
+                  mta_dat$pop_ID,
+                  text.col = "white",
+                  # text.col = as.character(mta_dat$lab_col),
+                  tickmarks = 0,
+                  dend=tdend,
+                  #manipulate scale
+                  cols=some.colorsEnd,
+                  scalenum = 5,
+                  cex.scale = 3,
+                  scalemar = c(5,5,5,5),
+                  labelsatx = (1:dim(tmpmat)[1]) -0.5,
+                  edgePar=list(p.lwd=0,t.srt=90,t.off=-0.1,t.cex=1.2),
+                  nodePar = list(cex=0,lab.cex=0.0001))
+dev.off()
+```
+
+# ggplot option
+developed: Matt Bootsma 12/12/2019
+```{r}
+#my dend data
+my_dend = dendro_data(tdend)
+my_dend$labels
+my_dend$segments
+# this is a list of the individual names in order corresponding to table
+# once written, go in, and add useful information to call below 
+# I do this in excel using vlookup for the unique pop names (extract using gsub("\\d","","ind_name") to remove ID numbers and just leave pop name) 
+# ADD:
+#   plt_rank; rownames (these are in already, but it's good to have a column that shouldn't change, this is the tree sort order)
+#   "lab_col"; colors, I use hexidecimals, these should correspond to some geographic or biological apriori grouping you have in mind.
+# mta_dat = read.csv("./tree_order.csv")
+```
+
+# make Dendrogram plots
+(this also has the color bar labels)
+```{r}
+# dend with color bar for IND labels, note that this requires a whitelist, sorted in same order as tree that has your color vector
+# I like to build that using excel and a vlookup function.
+mta_dat$lab_col_admx11 = as.factor(mta_dat$lab_col_admx11)
+mta_dat$lab_col_admx11 = as.character(mta_dat$lab_col_admx11)
+
+p_dendX = ggplot() +
+  geom_text(aes(x = mta_dat$plt_rank, y = -0.5, label = "|"),color = mta_dat$lab_col_admx11, cex = 5)+
+  geom_segment(data = my_dend$segments, aes(x=x, y=y, xend=xend, yend=yend), size = 0.5) +
+    # labs(x = 1:nrow(mta_dat), y = 0, label = "T", color = mta_dat$lab_col_admx11) + 
+    theme_nothing() +
+    theme(axis.text = element_blank(), axis.ticks = element_blank(),
+          panel.grid = element_blank())+
+        scale_x_continuous(expand=c(0,0)) + 
+        scale_y_continuous(expand=c(0,0.5))
+    
+p_dendX
+# this plot takes the x dend, 
+# flips X and Y coordinates to make it vertical (90 degree rotation counter clockwise)
+# then reverses the X axis to mirror the plot across a vertical plane
+# then reverses the Y axis to start at top and end at bottom, there is an associated flip in the p_heat plotting code below
+# the result corresponds directly to individual location in the heat map and allows us to plot what we want where we want.
+# as this results in 2 trees on the plot, simply delete/crop the one you don't want post production
+p_dendY = ggplot() +
+    geom_segment(data = my_dend$segments, aes(x=y, y=x, xend=yend, yend=xend), color = "white") +
+    # labs(x = 1:nrow(mta_dat), y = 0, label = "T", color = mta_dat$lab_col_admx11) + 
+    theme_nothing() +
+    theme(axis.text = element_blank(), axis.ticks = element_blank(),
+          panel.grid = element_blank())+
+        scale_x_reverse(expand=c(0,0.5)) + 
+        scale_y_reverse(expand=c(0,0))+
+    geom_text(aes(x = -0.5, y = mta_dat$plt_rank, label = "|"),color = mta_dat$lab_col_admx11[1:nrow(mta_dat)], cex = 10, angle = 90)
+p_dendY
+```
+
+
+# Make heatmap plot
+as input, use the matrix drived from the fineRADstrucutre code
+this is then turned into a long dataframe while retaining the appropriate XY coordinate information
+this allows for a ggplot approach
+```{r}
+split_clad_vec = c(23.5,
+                   64.5,
+                   116.5,
+                   165.5,
+                   209.5,
+                   
+                   320.5,
+                   
+                   520.5,
+                   565.5,
+                   619.5,
+                   649.5,
+                   718.5,
+                   747.5,
+                   786.5,
+                   813.5)
+# my heatmap
+# format into long format
+# Check if you have the averages or individual values
+tmpmat2 = as.data.frame(tmpmat)
+#append XY data, faster to append the XY data before melting
+get_y_coord = as.data.frame(rownames(tmpmat2))
+# sorted currently so rowname == y_coord
+get_y_coord$y_coord = as.integer(rownames(get_y_coord))
+colnames(get_y_coord) = c("Ind_y","y_coord")
+tmpmat3 = cbind.data.frame(get_y_coord$y_coord,get_y_coord$Ind_y,tmpmat2)
+colnames(tmpmat3)[2] = "Ind_y"
+colnames(tmpmat3)[1] = "y_coord"
+head(tmpmat3)
+#Change colnames to just the coord value prior to melt so they don't take 4 years to change
+for (i in 3:ncol(tmpmat3)) {
+    colnames(tmpmat3)[i] = mta_dat[which(mta_dat$Pop_A == colnames(tmpmat3)[i]),"plt_rank"]
+}
+head(tmpmat3)
+tmpmat4 = gather(tmpmat3, coord_x,CA_score,3:ncol(tmpmat3))
+tmpmat4$coord_x = as.integer(tmpmat4$coord_x)
+head(tmpmat4)
+# MAKE SURE COORDINATE ID VALUES ARE INT NOT FCTR
+# note that i reverse the Y axis order here, this means diagonal goes top left to bottom right,
+# IMPORTANT, there is an associated axis flip in the p_dendY plot code above
+p_heat = ggplot(tmpmat4, aes(x = coord_x, y = y_coord)) + 
+    geom_tile(aes(fill = CA_score))+
+    #### IF YOU WANT STANDALONE HEATMAP USE THIS AND COMMENT OUT THE FORMATTING BELOW
+    # theme(legend.position = "right",
+    #     axis.title = element_blank(),
+    #     axis.text = element_blank(),
+    #     axis.ticks = element_blank())+
+    #
+    #### FORMAT AS NOTHING BUT PLOT FOR MERGED FIG
+    labs(x = NULL, y = "") + theme_nothing() +
+    theme(axis.text = element_blank(), axis.ticks = element_blank(),
+          panel.grid = element_blank())+
+        scale_x_continuous(expand=c(0,0)) + 
+        scale_y_reverse(expand=c(0,0.5))+
+    geom_hline(yintercept = split_clad_vec, color = "gray", alpha = 0.7)+
+    geom_vline(xintercept = split_clad_vec, color = "gray", alpha = 0.7)+
+    # set color scale
+    scale_fill_gradientn(colors = c("#FFFF99","#FF0000","#FF00FF","#0000FF","black"), limits = c(20,45))
+# make blank heatmap with JUST SCALE to insert in third column of group plot. this is necessary to keep proportion of the rest of plot ==
+p_heat_bar = ggplot() + 
+    geom_tile(aes(x = 1, y = 1, fill = 0))+
+    #### IF YOU WANT STANDALONE HEATMAP USE THIS AND COMMENT OUT THE FORMATTING BELOW
+    theme(legend.position = "left",
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        legend.title = element_text(size = 50),
+        axis.line = element_blank())+
+    labs(fill = "")+
+    xlim(-2,-1)+
+    ylim(-2,-1)+
+    # set color scale
+    scale_fill_gradientn(colors = c("#FFFF99","#FF0000","#FF00FF","#0000FF","black"), limits = c(20,45))
+```
+# make blank plot for filling corners
+```{r}
+blnk_df = data.frame()
+p_blank = ggplot() + geom_point(aes(x = 1,y = 1), color = "white") + xlim(0, 10) + ylim(0, 100) + theme(axis.text = element_blank(), axis.ticks = element_blank(),panel.grid = element_blank(), axis.title = element_blank(), axis.line = element_blank())
+```
+
+# merge figures
+Note: the legend will be tiny, as it's actually part of an otherwise blank plot
+I use Illustrator to increase the size post plotting.
+```{r}
+# to easily remove a tree, change the color of segments to white (done above in make Dendogram plots section)
+pdf("./fineRADstructure_plots/testADMX_ggOption_d.pdf", width = 16, height = 14.4)
+ggarrange(p_blank,p_dendX,p_blank,
+          p_dendY,p_heat,p_heat_bar,
+          ncol = 3,
+          widths = c(5,40,5),
+          nrow = 2,
+          heights = c(5,40))
+dev.off()
+```
+
+```{r}
+tmpmat4$coord_x = as.integer(tmpmat4$coord_x)
+tmpmat4 %>% arrange(y_coord)
+```
+
+```{r}
+ttree$tip.label
+tmpmat2
+```
+
+
+```{r}
+# hide axis ticks and grid lines
+eaxis <- list(
+  showticklabels = FALSE,
+  showgrid = FALSE,
+  zeroline = FALSE
+)
+
+p_empty <- plot_ly(filename="r-docs/dendrogram") %>%
+  # note that margin applies to entire plot, so we can
+  # add it here to make tick labels more readable
+  layout(margin = list(l = 200),
+         xaxis = eaxis,
+         yaxis = eaxis)
+
+subplot(px, p_empty, p, py, nrows = 2, margin = 0.01)
+```
+# find line inserts
+this section sucks, to delimit your clades, you either have to insert lines by hand in some image editing software
+or hardcode them with a lot of trial and error. Neither will be fun, but this method is a precise and reproducable approach so I chose this path
+```{r}
+split_clad_vec = c(23.5,103.5,126.5,167.5,219.5,263.5,308.5,378.5,457.5,508.5,575.5,619.5,648.5,664.5,689.5,718.5,748.5,784.5,815.5)
+pdf("./fineRADstructure_plots/find_lines2.pdf", width = 20,height = 20)
+ggplot(tmpmat4, aes(x = coord_x, y = y_coord)) + 
+    geom_tile(aes(fill = CA_score))+
+    #### IF YOU WANT STANDALONE HEATMAP USE THIS AND COMMENT OUT THE FORMATTING BELOW
+    # theme(legend.position = "right",
+    #     axis.title = element_blank(),
+    #     axis.text = element_blank(),
+    #     axis.ticks = element_blank())+
+    #
+    #### FORMAT AS NOTHING BUT PLOT FOR MERGED FIG
+    labs(x = NULL, y = "") + theme_nothing() +
+    theme(axis.text = element_blank(), axis.ticks = element_blank(),
+          panel.grid = element_blank())+
+        scale_x_continuous(expand=c(0,0)) + 
+        scale_y_continuous(expand=c(0,0.5)
+  )+
+    # geom_hline(yintercept = split_clad_vec)+
+    geom_vline(xintercept = split_clad_vec)+
+    # set color scale
+    scale_fill_gradientn(colors = c("#FFFF99","#FF0000","#FF00FF","#0000FF","black"), limits = c(20,45))
+dev.off()
+```
+
+
+# merge average matrix with individual matrix
+```{r}
+
+# this is half of matrix I want
+
+########################
+## Plot 1: COANCESTRY MATRIX
+fullorder<-labels(tdend) # the order according to the tree
+datamatrix<-dataraw[fullorder,fullorder] # reorder the data matrix
+
+tmpmat_ind<-datamatrix 
+tmpmat_ind[tmpmat_ind>maxIndv]<-maxIndv #  # cap the heatmap
+df_tmpmat_ind = as.data.frame(tmpmat_ind)
+
+
+```
+
+# this is other half of matrix i want
+```{r}
+########################
+## Plot 2: POPULATIONS AND COANCESTRY AVERAGES
+popmeanmatrix<-getPopMeanMatrix(datamatrix,mapstatelist)
+
+tmpmat_avg<-popmeanmatrix
+tmpmat_avg[tmpmat_avg>maxPop]<-maxPop # cap the heatmap
+df_tmpmat_avg = as.data.frame(tmpmat_avg)
+```
+# testing dend manipulation
+```{r}
+data(mtcars)
+# matrix that becomes tree
+x <- as.matrix(head(mtcars))  # only using the first 6 cars for demo purpose
+row.hc <- hclust(dist(x))
+#'dendrogram' with 2 branches and 6 members total, at height 265.0832 
+row.dd <- as.dendrogram(row.hc)
+# base dend plot
+par(mar=c(8,3,1,1)) #just for labels to be in margins
+plot(row.dd) # plot call
+```
+```{r}
+labels(row.dd)  # dendrogram leaves
+```
+
+
+```{r}
+# calls indeces of your labels, this corresponds to the rownames of the matrix it was built from
+order.dendrogram(row.dd)  
+rownames(x)
+# build whitelist of names for NEW ORDER
+neworder = c("Valiant","Hornet 4 Drive","Datsun 710","Mazda RX4", "Mazda RX4 Wag","Hornet Sportabout")
+# REORDER dend based on the order of the first input
+# i.e. builds vector of indeces, the first will be the index of the first value in argument 1
+row.dd.reordered  = reorder(row.dd, wts = order(match(neworder, rownames(x))))
+```
+
+```{r}
+order.dendrogram(row.dd)  
+order.dendrogram(row.dd.reordered)  
+```
+
+```{r}
+plot(row.dd.reordered)
+```
+split_clad_vec = c(54.5,
+103.5,
+126.5,
+167.5,
+219.5,
+
+263.5,    SANFORD  (6)
+*
+308.5,    WI (2)
+*
+378.5,      CHIP (4)
+*
+457.5,      WI (3)
+508.5,     WI  (3)
+*
+575.5,    MILLICENT  (5)
+619.5,    CHIP       (5)
+*
+(7)
+664.5,     
+689.5,718.5,748.5,784.5,815.5)
+```{r}
+#'dendrogram' with 2 branches and 839 members total, at height 12.00002 
+tdend
+labels(tdend)
+order.dendrogram(tdend)  
+neworder = read.csv("./sort_coancestry_by_table.csv")
+tmpa = as.character(neworder$Pop_A[c(1:219,264:308,379:508,309:378,509:619,220:263,620:839)])
+
+tdend.reordered  = reorder(tdend, wts = order(((-log(match(tmpa, labels(tdend)))+10000))^3))
+plot(x = ((-log(match(tmpa, labels(tdend)))+100)^2)^2, y = length(labels(tdend)))
+order.dendrogram(tdend)  
+order.dendrogram(tdend.reordered)
+```
+
+
+```{r}
+# extract dend data for geom_segment
+my_dend = dendro_data(tdend)
+ggplot() + geom_segment(data = my_dend$segments, aes(x=x, y=y, xend=xend, yend=yend))+
+    geom_text(aes(x = mta_dat$plt_rank[order.dendrogram(tdend)], y = -0.5, label = "|"),color = mta_dat$lab_col[1:nrow(mta_dat)], cex = 10)+
+    geom_vline(xintercept = c(620))
+```
+
+
+```{r}
+my_dend = dendro_data(tdend.reordered)
+ggplot() + 
+    geom_segment(data = my_dend$segments, aes(x=x, y=y, xend=xend, yend=yend))+
+    geom_text(aes(x = mta_dat$plt_rank[order.dendrogram(tdend.reordered)], y = -0.5, label = "|"),color = mta_dat$lab_col[1:nrow(mta_dat)], cex = 10)
+```
+
+```{r}
+split_clad_vec = c(54.5,103.5,126.5,167.5,219.5,263.5,308.5,378.5,457.5,508.5,575.5,619.5,664.5,689.5,718.5,748.5,784.5,815.5)
+```
+
+# take the reordered tree and feed it into line 233 to get the correctly alligned coancestry matrix
